@@ -15,6 +15,7 @@ const (
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
 	StatusUnknown   = "unknown"
+	StatusPartial   = "partial"
 )
 
 var (
@@ -23,6 +24,8 @@ var (
 	ErrResultUnknown    = errors.New("write result is unknown")
 	ErrNaN              = errors.New("numeric value is NaN")
 )
+
+func isUnknownWriteError(err error) bool { return errors.Is(err, ErrResultUnknown) }
 
 type Upstream interface {
 	Name() string
@@ -67,9 +70,12 @@ type TraceStore struct {
 	mu      sync.RWMutex
 	records []Trace
 	byID    map[string]Trace
+	batches *batchStore
 }
 
-func NewTraceStore() *TraceStore { return &TraceStore{byID: map[string]Trace{}} }
+func NewTraceStore() *TraceStore {
+	return &TraceStore{byID: map[string]Trace{}, batches: newBatchStore()}
+}
 
 func (s *TraceStore) Add(t Trace) {
 	s.mu.Lock()

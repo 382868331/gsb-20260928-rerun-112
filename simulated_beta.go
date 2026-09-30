@@ -12,7 +12,10 @@ type SimulatedBetaDevice struct {
 	registers map[string]int32
 	Hooks     map[string]func(BetaRequest) BetaResponse
 	CloseOn   map[string]bool
-	Delay     map[string]time.Duration
+	// ApplyThenDrop models a lost response: the device mutates its register
+	// (the side effect really happens) but sends nothing back.
+	ApplyThenDrop map[string]bool
+	Delay         map[string]time.Duration
 }
 
 func NewSimulatedBetaDevice(values map[string]int32) *SimulatedBetaDevice {
@@ -20,7 +23,7 @@ func NewSimulatedBetaDevice(values map[string]int32) *SimulatedBetaDevice {
 	for k, v := range values {
 		clone[k] = v
 	}
-	return &SimulatedBetaDevice{registers: clone, Hooks: map[string]func(BetaRequest) BetaResponse{}, CloseOn: map[string]bool{}, Delay: map[string]time.Duration{}}
+	return &SimulatedBetaDevice{registers: clone, Hooks: map[string]func(BetaRequest) BetaResponse{}, CloseOn: map[string]bool{}, ApplyThenDrop: map[string]bool{}, Delay: map[string]time.Duration{}}
 }
 
 func (d *SimulatedBetaDevice) Value(tag string) (int32, bool) {
@@ -70,6 +73,12 @@ func (d *SimulatedBetaDevice) serveConn(ctx context.Context, conn net.Conn) {
 			}
 		}
 		if d.CloseOn[req.Tag] {
+			_ = conn.Close()
+			return
+		}
+		if req.Op == BetaWrite && d.ApplyThenDrop[req.Tag] {
+			// Side effect is committed, evidence (the response) is lost.
+			_ = d.handle(req)
 			_ = conn.Close()
 			return
 		}

@@ -160,5 +160,10 @@ func DefaultMappings() []FieldMapping {
 			Alpha: EndpointSpec{Protocol: AlphaProtocol, Tag: "register:40002", DataType: "uint16", Unit: "kPa", Scale: 1, MinRaw: 0, MaxRaw: 10000, Endian: BigEndian},
 			Beta:  EndpointSpec{Protocol: BetaProtocol, Tag: "P1", DataType: "int16", Unit: "psi", Scale: 0.01, MinRaw: 0, MaxRaw: 14504, Endian: LittleEndian},
 		},
+		{
+			Name:  "setpoint",
+			Alpha: EndpointSpec{Protocol: AlphaProtocol, Tag: "register:40003", DataType: "int16", Unit: "degC", Scale: 0.1, MinRaw: -1000, MaxRaw: 5000, Endian: BigEndian},
+			Beta:  EndpointSpec{Protocol: BetaProtocol, Tag: "S1", DataType: "int16", Unit: "degC", Scale: 0.01, MinRaw: -10000, MaxRaw: 50000, Endian: LittleEndian},
+		},
 	}
 }

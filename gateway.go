@@ -15,6 +15,7 @@ const (
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
 	StatusUnknown   = "unknown"
+	StatusPartial   = "partial"
 )
 
 var (
@@ -46,9 +47,26 @@ type Trace struct {
 	OutValue  *float64      `json:"out_value,omitempty"`
 	BackValue *float64      `json:"back_value,omitempty"`
 	Attempts  int           `json:"attempts"`
+	Snapshot  bool          `json:"same_device_instant"`
 	Error     string        `json:"error,omitempty"`
 	Events    []TraceEvent  `json:"events"`
 	Frames    []TraceFrame  `json:"frames"`
+	Fields    []TraceField  `json:"fields,omitempty"`
+}
+
+// TraceField holds per-field status and evidence for a multi-field operation.
+type TraceField struct {
+	Field      string       `json:"field"`
+	Register   string       `json:"register"`
+	Status     string       `json:"status"`
+	Attempts   int          `json:"attempts"`
+	ObservedAt *time.Time   `json:"observed_at,omitempty"`
+	InValue    *float64     `json:"in_value,omitempty"`
+	Canonical  *float64     `json:"canonical_value,omitempty"`
+	OutValue   *float64     `json:"out_value,omitempty"`
+	BackValue  *float64     `json:"back_value,omitempty"`
+	Error      string       `json:"error,omitempty"`
+	Frames     []TraceFrame `json:"frames,omitempty"`
 }
 
 type TraceEvent struct {
@@ -60,6 +78,7 @@ type TraceEvent struct {
 type TraceFrame struct {
 	Direction string `json:"direction"`
 	Protocol  string `json:"protocol"`
+	Field     string `json:"field,omitempty"`
 	Hex       string `json:"hex"`
 }
 
@@ -140,13 +159,27 @@ func (c *Channel) ServeAlpha(ctx context.Context, listener net.Listener) error {
 }
 
 func (c *Channel) HandleAlphaConn(ctx context.Context, conn net.Conn) error {
-	req, raw, err := ReadAlphaRequest(conn)
+	function, _, raw, batchReq, err := ReadAlphaFrame(conn)
 	if err != nil {
 		t := Trace{ID: c.NewID(), Channel: c.Name, StartedAt: c.Now(), From: AlphaProtocol, To: c.Upstream.Name(), Attempts: 1, Status: StatusFailed, Error: err.Error()}
 		t.Frames = append(t.Frames, TraceFrame{Direction: "in", Protocol: AlphaProtocol, Hex: fmtHex(raw)})
 		c.event(&t, "decode", err.Error())
 		c.Traces.Add(t)
 		return err
+	}
+	if batchReq != nil {
+		resp, trace := c.ProcessBatch(ctx, *batchReq)
+		trace.Frames = append([]TraceFrame{{Direction: "in", Protocol: AlphaProtocol, Hex: fmtHex(raw)}}, trace.Frames...)
+		out := resp.Encode()
+		trace.Frames = append(trace.Frames, TraceFrame{Direction: "out", Protocol: AlphaProtocol, Hex: fmtHex(out)})
+		c.Traces.Add(trace)
+		_, err = conn.Write(out)
+		return err
+	}
+	req := AlphaRequest{Function: function}
+	decoded, derr := DecodeAlphaRequest(raw)
+	if derr == nil {
+		req = decoded
 	}
 	resp, trace := c.processAlphaRequest(ctx, req)
 	trace.Frames = append(trace.Frames, TraceFrame{Direction: "in", Protocol: AlphaProtocol, Hex: fmtHex(raw)})

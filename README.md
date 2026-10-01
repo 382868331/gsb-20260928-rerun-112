@@ -35,6 +35,27 @@
 
 `SimulatedBetaDevice.ApplyThenDrop` 模拟“设备已落盘但响应丢失”：写副作用真实发生，连接却不返回任何响应，用于核对超时修改不能被当成未发生。
 
+## 带前置条件的批量写入
+
+`Channel.ConditionalBatchWrite` 在每项写入前先做只读核对：只有设备当前值仍等于操作者看到的值（`Precondition` 中的 alpha 原始值与读取时刻）时才执行修改。每项独立报告状态，绝不合并成一个总失败：
+
+- `completed`：条件符合且写入已被确认，已生效。
+- `unknown`：响应丢失或断连，仍待确认；网关假定写入可能已发生，不会重发。
+- `condition_mismatch`：设备当前值与操作者看到的不符，未发送任何写帧。
+- `not_attempted`：前置核对本身读不到设备值，写入未尝试。
+- `conflict`：后续处理时发现设备被外部改动，网关拒绝盲目覆盖。
+
+每项保留换算前后的值、条件来源值与读取时刻、改前设备值（`PreValue`）和报文证据；跨单位换算不会抹掉原字段来源。
+
+## 部分生效批次的后续处理
+
+- `Channel.ContinueBatch`：只处理未完成项。`unknown` 项先走只读读回，确认一致则标记完成（不重发写）；若设备持有其他值（回应丢失 + 设备自行变化），标记 `conflict`，绝不盲目重复写入。`not_attempted` / `condition_mismatch` 项重新做完整条件核对，仅当设备当前值符合条件时才写入。
+- `Channel.RevertBatch`：按明确规则 `RevertToPreBatchValue` 恢复已改项，恢复目标只能是本批改前记录的设备真实值；恢复前再次读回核对，设备仍持有本批写入的值才恢复，已被外部改动的项标记 `conflict` 并保持原样。
+
+## 不确定项的持久化
+
+`BatchJournal`（`LoadBatchJournal(path)`，挂到 `Channel.Journal`）把每个条件批次落盘：字段、请求的 alpha 原始值、实际发送的 beta 原始值、前置条件来源值与读取时刻、改前设备值和每项状态。网关重启后从日志重新加载记录，用 `VerifyConditionalItem` 继续只读核对 `unknown` 项，不需要重新提交写入。
+
 ## 本地验证
 
 模拟设备使用 `net.Pipe` 或本地 listener，不连接真实硬件：

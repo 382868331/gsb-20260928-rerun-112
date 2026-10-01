@@ -104,8 +104,11 @@ type Channel struct {
 	Mappings map[string]FieldMapping
 	Upstream Upstream
 	Traces   *TraceStore
-	Now      func() time.Time
-	NewID    func() string
+	// Journal, when set, persists every conditional batch mutation so
+	// uncertain items stay verifiable across restarts.
+	Journal *BatchJournal
+	Now     func() time.Time
+	NewID   func() string
 }
 
 func NewChannel(name string, upstream Upstream, traces *TraceStore, mappings ...FieldMapping) (*Channel, error) {

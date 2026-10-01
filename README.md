@@ -48,3 +48,21 @@ go test ./... -count=1 -race
 ## 扩展适配器
 
 新协议实现 `Upstream` 接口，并通过 `NewChannel(..., mappings...)` 显式注册字段映射即可。通道继续通过同一个 `TraceStore` 记录完整来回；新增适配器不得在写入结果不确定时自行重试。
+
+## 带前置条件的批量写入
+
+`Channel.ConditionalBatchWrite` 支持为每一项附带 `WriteCondition`（操作者看到的值与观察时刻）。网关在写入前先只读核对设备当前值，只有与条件一致才执行修改。每项独立报告状态，绝不合并成一个总失败：
+
+- `not_attempted`：条件无法核对（读失败），设备未被触碰。
+- `condition_mismatch`：设备当前值与操作者看到的不符，跳过该项修改。
+- `applied`：设备已确认生效。
+- `pending_confirm`：响应丢失，结果未知，只能通过只读回读核实。
+- `conflict`：后续核对发现设备自行变化，需要操作者裁决。
+- `reverted`：恢复已把字段写回修改前的值。
+
+`ConditionEvidence` 在跨单位换算后仍保留原字段来源、操作者看到的 alpha 原始值、换算后的 beta 原始值、核对时设备实际值以及观察与核对两个时刻。批次结果通过 `TraceStore.AddConditionalBatch` / `GetConditionalBatch` 持久化，重开会话后可继续核对不确定项。
+
+部分生效批次的后续处理：
+
+- `Channel.ContinueConditionalBatch`：继续未完成项。`pending_confirm` 项只读回读——确认则转为 `applied`，发现设备持有其他值（响应丢失与设备自行变化同时出现）则转为 `conflict`，绝不盲目重复写入；`not_attempted` / `condition_mismatch` 项按当前设备真实值重新核对条件后再写。
+- `Channel.RollbackConditionalBatch`：按明确规则恢复已改项——写回条件记录的修改前的值。恢复同样先读回设备真实值，仅当设备仍持有本批次写入的值时才回退；设备已自行变化则标记 `conflict` 并保持不动。

@@ -97,7 +97,7 @@ func (r *ConditionalBatchResult) summarize(now func() time.Time) {
 		switch item.Status {
 		case ItemApplied, ItemReverted:
 			applied++
-		case ItemPendingConfirm, ItemNotAttempted, ItemConflict:
+		case ItemPendingConfirm, ItemNotAttempted, ItemConflict, ItemNeedsReconfirm:
 			pending++
 		default:
 			failed++

@@ -21,10 +21,11 @@ type batchStore struct {
 	rows        []BatchTrace
 	byID        map[string]BatchTrace
 	conditional map[string]ConditionalBatchResult
+	previews    map[string]PreviewBatch
 }
 
 func newBatchStore() *batchStore {
-	return &batchStore{byID: map[string]BatchTrace{}, conditional: map[string]ConditionalBatchResult{}}
+	return &batchStore{byID: map[string]BatchTrace{}, conditional: map[string]ConditionalBatchResult{}, previews: map[string]PreviewBatch{}}
 }
 
 func (s *batchStore) add(t BatchTrace) {
@@ -70,4 +71,37 @@ func (s *TraceStore) GetConditionalBatch(id string) (ConditionalBatchResult, boo
 	defer s.batches.mu.RUnlock()
 	r, ok := s.batches.conditional[id]
 	return r, ok
+}
+
+// AddPreviewBatch persists the preview / confirmation / effect facts of a
+// dry-run batch, replacing any earlier state under the same ID, so an
+// interrupted session can reopen and continue confirming or executing.
+func (s *TraceStore) AddPreviewBatch(p PreviewBatch) {
+	s.batches.mu.Lock()
+	defer s.batches.mu.Unlock()
+	s.batches.previews[p.ID] = p
+	if _, seen := s.batches.byID[p.ID]; !seen {
+		s.batches.rows = append(s.batches.rows, BatchTrace{ID: p.ID, Kind: "preview_batch", StartedAt: p.CreatedAt, Status: "preview"})
+		s.batches.byID[p.ID] = s.batches.rows[len(s.batches.rows)-1]
+	}
+}
+
+// GetPreviewBatch reopens a stored preview batch by ID.
+func (s *TraceStore) GetPreviewBatch(id string) (PreviewBatch, bool) {
+	s.batches.mu.RLock()
+	defer s.batches.mu.RUnlock()
+	p, ok := s.batches.previews[id]
+	return p, ok
+}
+
+// ListPreviewBatches returns all stored preview batches, e.g. to detect
+// shared constraints between parallel batches on the same channel.
+func (s *TraceStore) ListPreviewBatches() []PreviewBatch {
+	s.batches.mu.RLock()
+	defer s.batches.mu.RUnlock()
+	out := make([]PreviewBatch, 0, len(s.batches.previews))
+	for _, p := range s.batches.previews {
+		out = append(out, p)
+	}
+	return out
 }

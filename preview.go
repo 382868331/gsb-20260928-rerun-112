@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math"
-	"sort"
 	"time"
 )
 
@@ -24,27 +23,32 @@ const (
 // after unit conversion and the impact against the value the device held when
 // the preview read it. Nothing is written during a preview.
 type PreviewItem struct {
-	Field           string             `json:"field"`
-	BetaTag         string             `json:"beta_tag"`
-	Requested       float64            `json:"requested_alpha_raw"`
-	TargetBetaRaw   *float64           `json:"target_beta_raw,omitempty"`
-	CurrentBetaRaw  *float64           `json:"current_beta_raw,omitempty"`
-	CurrentAlphaRaw *float64           `json:"current_alpha_raw,omitempty"`
-	Condition       *ConditionEvidence `json:"condition,omitempty"`
-	Status          string             `json:"status"` // "ok" or "blocked"
-	Error           string             `json:"error,omitempty"`
-	Frames          []TraceFrame       `json:"frames"`
+	Field              string             `json:"field"`
+	BetaTag            string             `json:"beta_tag"`
+	Requested          float64            `json:"requested_alpha_raw"`
+	TargetBetaRaw      *float64           `json:"target_beta_raw,omitempty"`
+	CurrentBetaRaw     *float64           `json:"current_beta_raw,omitempty"`
+	CurrentAlphaRaw    *float64           `json:"current_alpha_raw,omitempty"`
+	Condition          *ConditionEvidence `json:"condition,omitempty"`
+	MappingFingerprint string             `json:"mapping_fingerprint,omitempty"`
+	Status             string             `json:"status"` // "ok" or "blocked"
+	Error              string             `json:"error,omitempty"`
+	Frames             []TraceFrame       `json:"frames"`
 }
 
 // ItemConfirmation binds the operator's approval to exactly the facts seen at
-// preview time: this field, the device value read then, and the conversion
-// rules (mapping fingerprint) in effect then.
+// preview time: this field and write endpoint, requested/confirmed values,
+// device value, precondition, and the mapping rules in effect then.
 type ItemConfirmation struct {
-	State           string     `json:"state"`
-	ObservedBetaRaw *float64   `json:"observed_beta_raw,omitempty"`
-	Fingerprint     string     `json:"fingerprint"`
-	ConfirmedAt     time.Time  `json:"confirmed_at,omitempty"`
-	WithdrawnAt     *time.Time `json:"withdrawn_at,omitempty"`
+	State              string             `json:"state"`
+	BetaTag            string             `json:"beta_tag"`
+	RequestedAlphaRaw  float64            `json:"requested_alpha_raw"`
+	TargetBetaRaw      *float64           `json:"target_beta_raw,omitempty"`
+	ObservedBetaRaw    *float64           `json:"observed_beta_raw,omitempty"`
+	Condition          *ConditionEvidence `json:"condition,omitempty"`
+	MappingFingerprint string             `json:"mapping_fingerprint"`
+	ConfirmedAt        time.Time          `json:"confirmed_at,omitempty"`
+	WithdrawnAt        *time.Time         `json:"withdrawn_at,omitempty"`
 }
 
 // EffectFact records what actually happened to the device at execution time,
@@ -77,25 +81,43 @@ func (p *PreviewBatch) event(at time.Time, stage, message string) {
 	p.Events = append(p.Events, TraceEvent{At: at, Stage: stage, Message: message})
 }
 
-// mappingFingerprint identifies the conversion rules currently in effect. If
-// any endpoint spec changes, previews confirmed under the old rules are no
-// longer valid.
-func (c *Channel) mappingFingerprint() string {
-	unique := map[string]FieldMapping{}
-	for _, m := range c.Mappings {
-		unique[m.Name] = m
-	}
-	names := make([]string, 0, len(unique))
-	for name := range unique {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+// mappingFingerprint identifies every fact in one mapping that can change the
+// converted value or the device endpoint that receives it. Fingerprints are
+// per field so an unrelated mapping change does not invalidate another item.
+func mappingFingerprint(mapping FieldMapping) string {
 	h := fnv.New64a()
-	for _, name := range names {
-		data, _ := json.Marshal(unique[name])
-		_, _ = h.Write(data)
+	data, _ := json.Marshal(mapping)
+	_, _ = h.Write(data)
+	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+func previewFingerprint(items []PreviewItem) string {
+	h := fnv.New64a()
+	for _, item := range items {
+		_, _ = h.Write([]byte(item.Field))
+		_, _ = h.Write([]byte(item.MappingFingerprint))
 	}
 	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+func conditionsEqual(want, got *ConditionEvidence) bool {
+	if want == nil || got == nil {
+		return want == got
+	}
+	wantObserved, gotObserved := false, false
+	if want.ObservedBetaRaw != nil {
+		wantObserved = true
+	}
+	if got.ObservedBetaRaw != nil {
+		gotObserved = true
+	}
+	return want.Field == got.Field &&
+		want.ExpectedAlphaRaw == got.ExpectedAlphaRaw &&
+		want.ExpectedBetaRaw == got.ExpectedBetaRaw &&
+		wantObserved == gotObserved &&
+		(!wantObserved || *want.ObservedBetaRaw == *got.ObservedBetaRaw) &&
+		want.OperatorSeenAt.Equal(got.OperatorSeenAt) &&
+		want.CheckedAt.Equal(got.CheckedAt)
 }
 
 // PreviewConditionalBatch is the dry run: it converts every requested value
@@ -103,11 +125,10 @@ func (c *Channel) mappingFingerprint() string {
 // the impact (current -> target in both unit systems). It never writes.
 func (c *Channel) PreviewConditionalBatch(ctx context.Context, requests []ConditionalWriteRequest) PreviewBatch {
 	preview := PreviewBatch{
-		ID:          c.NewID(),
-		Channel:     c.Name,
-		CreatedAt:   c.Now(),
-		Fingerprint: c.mappingFingerprint(),
-		Confirms:    map[string]*ItemConfirmation{},
+		ID:        c.NewID(),
+		Channel:   c.Name,
+		CreatedAt: c.Now(),
+		Confirms:  map[string]*ItemConfirmation{},
 	}
 	preview.event(c.Now(), "preview_start", fmt.Sprintf("dry run of %d fields; read-only, no device modification", len(requests)))
 	for _, request := range requests {
@@ -118,6 +139,7 @@ func (c *Channel) PreviewConditionalBatch(ctx context.Context, requests []Condit
 			preview.event(c.Now(), "preview_blocked", item.Field+": "+item.Error)
 		}
 	}
+	preview.Fingerprint = previewFingerprint(preview.Items)
 	c.Traces.AddPreviewBatch(preview)
 	return preview
 }
@@ -130,6 +152,7 @@ func (c *Channel) previewOne(ctx context.Context, request ConditionalWriteReques
 		item.Error = fmt.Sprintf("%s: %s", ErrUnsupportedField.Error(), request.Field)
 		return item
 	}
+	item.MappingFingerprint = mappingFingerprint(mapping)
 	item.BetaTag = mapping.Beta.Tag
 	if err := mapping.Alpha.ValidateRaw(request.Value); err != nil {
 		item.Status = "blocked"
@@ -199,6 +222,9 @@ func (c *Channel) ConfirmPreviewItem(previewID, field string) ([]string, error) 
 	if confirmation.State == ConfirmWithdrawn {
 		return nil, fmt.Errorf("confirmation for %s was withdrawn and cannot be re-enabled; run a new preview", field)
 	}
+	if confirmation.State == ConfirmNeedsReconfirm {
+		return nil, fmt.Errorf("confirmation for %s is stale; run a new preview before confirming it", field)
+	}
 	var item *PreviewItem
 	for i := range preview.Items {
 		if preview.Items[i].Field == field {
@@ -211,8 +237,12 @@ func (c *Channel) ConfirmPreviewItem(previewID, field string) ([]string, error) 
 	conflicts := c.crossPreviewConflicts(preview, *item)
 	confirmation.State = ConfirmConfirmed
 	confirmation.ConfirmedAt = c.Now()
+	confirmation.BetaTag = item.BetaTag
+	confirmation.RequestedAlphaRaw = item.Requested
+	confirmation.TargetBetaRaw = item.TargetBetaRaw
 	confirmation.ObservedBetaRaw = item.CurrentBetaRaw
-	confirmation.Fingerprint = preview.Fingerprint
+	confirmation.Condition = item.Condition
+	confirmation.MappingFingerprint = item.MappingFingerprint
 	preview.Conflicts = append(preview.Conflicts, conflicts...)
 	preview.event(c.Now(), "item_confirmed", field)
 	for _, conflict := range conflicts {
@@ -271,16 +301,16 @@ func (c *Channel) WithdrawPreviewConfirmation(previewID, field string) error {
 }
 
 // ExecuteConfirmedPreview applies the confirmed items of a stored preview.
-// Before each write the device value and the conversion rules are compared
-// against the confirmed facts: if either changed, only the affected items are
-// marked needs_reconfirm and skipped; the other confirmed items proceed.
+// Before each write the endpoint, mapping rules, requested/confirmed target,
+// precondition and device value are compared against the confirmed facts. If
+// any fact changed, only the affected item is marked needs_reconfirm and
+// skipped; the other confirmed items proceed.
 // A lost response is resolved by a read-only read-back, never by resending.
 func (c *Channel) ExecuteConfirmedPreview(ctx context.Context, previewID string) (PreviewBatch, error) {
 	preview, ok := c.Traces.GetPreviewBatch(previewID)
 	if !ok {
 		return PreviewBatch{}, fmt.Errorf("unknown preview %s", previewID)
 	}
-	fingerprint := c.mappingFingerprint()
 	preview.event(c.Now(), "execute_start", fmt.Sprintf("executing confirmed items of preview %s", previewID))
 	for i := range preview.Items {
 		item := preview.Items[i]
@@ -289,7 +319,7 @@ func (c *Channel) ExecuteConfirmedPreview(ctx context.Context, previewID string)
 			preview.event(c.Now(), "item_skipped", item.Field+": not confirmed")
 			continue
 		}
-		effect := c.executeOne(ctx, &preview, i, confirmation, fingerprint)
+		effect := c.executeOne(ctx, &preview, i, confirmation)
 		preview.Effects = append(preview.Effects, effect)
 		preview.event(c.Now(), "effect_"+effect.Outcome, item.Field)
 	}
@@ -297,13 +327,21 @@ func (c *Channel) ExecuteConfirmedPreview(ctx context.Context, previewID string)
 	return preview, nil
 }
 
-func (c *Channel) executeOne(ctx context.Context, preview *PreviewBatch, index int, confirmation *ItemConfirmation, fingerprint string) EffectFact {
+func (c *Channel) executeOne(ctx context.Context, preview *PreviewBatch, index int, confirmation *ItemConfirmation) EffectFact {
 	item := preview.Items[index]
 	effect := EffectFact{Field: item.Field, At: c.Now()}
 	mapping, ok := c.Mappings[item.Field]
 	if !ok {
 		confirmation.State = ConfirmNeedsReconfirm
 		effect.Outcome = ItemFailed
+		return effect
+	}
+	if mapping.Name != item.Field || confirmation.BetaTag != item.BetaTag || confirmation.BetaTag != mapping.Beta.Tag ||
+		confirmation.MappingFingerprint != mappingFingerprint(mapping) || confirmation.MappingFingerprint != item.MappingFingerprint ||
+		confirmation.RequestedAlphaRaw != item.Requested || confirmation.TargetBetaRaw == nil || item.TargetBetaRaw == nil ||
+		*confirmation.TargetBetaRaw != *item.TargetBetaRaw || !conditionsEqual(confirmation.Condition, item.Condition) {
+		confirmation.State = ConfirmNeedsReconfirm
+		effect.Outcome = ItemNotAttempted
 		return effect
 	}
 	recorder := frameRecorderFunc(func(direction, protocol string, data []byte) {
@@ -317,21 +355,20 @@ func (c *Channel) executeOne(ctx context.Context, preview *PreviewBatch, index i
 		return effect
 	}
 	effect.ObservedBetaRaw = &current
-	// Re-validate only this item against the facts the operator confirmed.
-	if confirmation.Fingerprint != fingerprint {
-		confirmation.State = ConfirmNeedsReconfirm
-		effect.Outcome = ItemNotAttempted
-		return effect
-	}
 	if confirmation.ObservedBetaRaw == nil || math.Abs(current-*confirmation.ObservedBetaRaw) > 1e-9 {
 		confirmation.State = ConfirmNeedsReconfirm
 		effect.Outcome = ItemNotAttempted
 		return effect
 	}
-	target, err := mapping.AlphaToBeta(item.Requested)
-	if err != nil {
+	if confirmation.Condition != nil && math.Abs(current-confirmation.Condition.ExpectedBetaRaw) > 1e-9 {
 		confirmation.State = ConfirmNeedsReconfirm
-		effect.Outcome = ItemFailed
+		effect.Outcome = ItemConditionMismatch
+		return effect
+	}
+	target, err := mapping.AlphaToBeta(item.Requested)
+	if err != nil || math.Abs(target-*confirmation.TargetBetaRaw) > 1e-9 {
+		confirmation.State = ConfirmNeedsReconfirm
+		effect.Outcome = ItemNotAttempted
 		return effect
 	}
 	effect.SentBetaRaw = &target

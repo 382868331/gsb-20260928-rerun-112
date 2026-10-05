@@ -75,6 +75,115 @@ func TestExecuteAppliesOnlyConfirmedItems(t *testing.T) {
 	}
 }
 
+func TestExecuteSendsExactlyPreviewConfirmedTarget(t *testing.T) {
+	device := NewSimulatedBetaDevice(map[string]int32{"T1": 20000})
+	channel, _ := newTestChannel(t, device, time.Second)
+
+	preview := channel.PreviewConditionalBatch(context.Background(), []ConditionalWriteRequest{
+		{Field: "temperature", Value: 2310},
+	})
+	confirmedTarget := preview.Items[0].TargetBetaRaw
+	if confirmedTarget == nil || *confirmedTarget != 23100 {
+		t.Fatalf("target=%v, want 23100", confirmedTarget)
+	}
+	if _, err := channel.ConfirmPreviewItem(preview.ID, "temperature"); err != nil {
+		t.Fatal(err)
+	}
+
+	executed, err := channel.ExecuteConfirmedPreview(context.Background(), preview.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(executed.Effects) != 1 {
+		t.Fatalf("effects=%+v", executed.Effects)
+	}
+	sent := executed.Effects[0].SentBetaRaw
+	if sent == nil || *sent != *confirmedTarget || *sent != 23100 {
+		t.Fatalf("sent=%v confirmed target=%v", sent, confirmedTarget)
+	}
+	if v, _ := device.Value("T1"); v != 23100 {
+		t.Fatalf("T1=%d, actual write does not match confirmed value", v)
+	}
+}
+
+func TestTemperatureScaleChangeRequiresNewPreviewButPressureStillExecutes(t *testing.T) {
+	device := NewSimulatedBetaDevice(map[string]int32{"T1": 20000, "P1": 0})
+	channel, _ := newTestChannel(t, device, time.Second)
+
+	preview := channel.PreviewConditionalBatch(context.Background(), []ConditionalWriteRequest{
+		{Field: "temperature", Value: 2310},
+		{Field: "pressure", Value: 68.94757},
+	})
+	if preview.Items[0].TargetBetaRaw == nil || *preview.Items[0].TargetBetaRaw != 23100 {
+		t.Fatalf("temperature target=%+v", preview.Items[0])
+	}
+	for _, field := range []string{"temperature", "pressure"} {
+		if _, err := channel.ConfirmPreviewItem(preview.ID, field); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	temperature := channel.Mappings["temperature"]
+	temperature.Beta.Scale = 0.02
+	channel.Mappings["temperature"] = temperature
+	channel.Mappings[temperature.Alpha.Tag] = temperature
+
+	executed, err := channel.ExecuteConfirmedPreview(context.Background(), preview.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := executed.Confirms["temperature"].State; got != ConfirmNeedsReconfirm {
+		t.Fatalf("temperature confirmation=%s, want needs_reconfirm", got)
+	}
+	if v, _ := device.Value("T1"); v != 20000 {
+		t.Fatalf("T1=%d, stale temperature confirmation was written", v)
+	}
+	if len(executed.Effects) != 2 {
+		t.Fatalf("effects=%+v", executed.Effects)
+	}
+	var temperatureEffect, pressureEffect *EffectFact
+	for i := range executed.Effects {
+		switch executed.Effects[i].Field {
+		case "temperature":
+			temperatureEffect = &executed.Effects[i]
+		case "pressure":
+			pressureEffect = &executed.Effects[i]
+		}
+	}
+	if temperatureEffect == nil || temperatureEffect.SentBetaRaw != nil || temperatureEffect.Outcome != ItemNotAttempted {
+		t.Fatalf("temperature effect=%+v", temperatureEffect)
+	}
+	if pressureEffect == nil || pressureEffect.SentBetaRaw == nil || *pressureEffect.SentBetaRaw != 1000 || pressureEffect.Outcome != ItemApplied {
+		t.Fatalf("pressure effect=%+v", pressureEffect)
+	}
+	if v, _ := device.Value("P1"); v != 1000 {
+		t.Fatalf("P1=%d, unchanged pressure mapping must execute independently", v)
+	}
+	if _, err := channel.ConfirmPreviewItem(preview.ID, "temperature"); err == nil {
+		t.Fatal("stale confirmation was re-enabled without a new preview")
+	}
+
+	repreview := channel.PreviewConditionalBatch(context.Background(), []ConditionalWriteRequest{
+		{Field: "temperature", Value: 2310},
+	})
+	if repreview.Items[0].TargetBetaRaw == nil || *repreview.Items[0].TargetBetaRaw != 11550 {
+		t.Fatalf("repreview target=%+v, want current-rule target 11550", repreview.Items[0])
+	}
+	if _, err := channel.ConfirmPreviewItem(repreview.ID, "temperature"); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := channel.ExecuteConfirmedPreview(context.Background(), repreview.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Effects[0].Outcome != ItemApplied {
+		t.Fatalf("retried effect=%+v", retried.Effects)
+	}
+	if v, _ := device.Value("T1"); v != 11550 {
+		t.Fatalf("T1=%d, want value from a fresh preview and confirmation", v)
+	}
+}
+
 func TestExecuteFlagsOnlyAffectedItemsWhenDeviceOrRulesChange(t *testing.T) {
 	device := NewSimulatedBetaDevice(map[string]int32{"T1": 25000, "P1": 0})
 	channel, _ := newTestChannel(t, device, time.Second)
@@ -157,6 +266,17 @@ func TestWithdrawnConfirmationCannotBeReenabledByLateRequest(t *testing.T) {
 	}
 	if v, _ := device.Value("T1"); v != 25000 {
 		t.Fatalf("T1=%d, withdrawn confirmation must not execute", v)
+	}
+	writeRequests := 0
+	for _, item := range executed.Items {
+		for _, frame := range item.Frames {
+			if frame.Direction == "out" && strings.HasPrefix(frame.Hex, "5a0802") {
+				writeRequests++
+			}
+		}
+	}
+	if writeRequests != 0 {
+		t.Fatalf("write frames after withdrawal=%d", writeRequests)
 	}
 }
 

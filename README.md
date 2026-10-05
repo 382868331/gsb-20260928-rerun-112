@@ -72,8 +72,8 @@ go test ./... -count=1 -race
 条件批量写入另有一条不直接落设备的操作路径，由人工在预演后逐项确认再执行：
 
 - `Channel.PreviewConditionalBatch` 是只读预演：逐项给出单位换算后的目标值（beta 原始值）和相对设备当前值的影响（当前 beta/alpha 原始值），并核对前置条件；预演不产生任何写帧。
-- `Channel.ConfirmPreviewItem` 把确认绑定到预演当时看到的事实：字段、设备当前值和换算规则指纹。并行批次可以修改同一设备的不同字段；若两个未关闭的预演写同一字段、或一个批次的写入使另一个批次的前置条件失效，确认时报告共享约束冲突。
-- `Channel.ExecuteConfirmedPreview` 只执行已确认项。执行前逐项重新读取设备并比对换算规则指纹：设备状态或换算规则已变化的项被标为 `needs_reconfirm` 并跳过，其余已确认项照常执行。响应丢失时通过真实读回确认效果（`verified_by=read_back`），绝不盲目重发。
+- `Channel.ConfirmPreviewItem` 把确认绑定到预演当时看到的事实：字段、设备当前值、确认的目标值（beta 原始值）和该字段换算规则的完整指纹（数据类型、单位、比例、偏移、量程、端序、标签）。并行批次可以修改同一设备的不同字段；若两个未关闭的预演写同一字段、或一个批次的写入使另一个批次的前置条件失效，确认时报告共享约束冲突。
+- `Channel.ExecuteConfirmedPreview` 只执行已确认项。执行前逐项复核确认依据：该字段换算规则指纹未变、确认目标值与当前换算结果一致、设备当前值与确认时一致；任一条件不满足的项被标为 `needs_reconfirm` 并跳过，写入的正好是确认时的目标值，其余已确认项照常执行。响应丢失时通过真实读回确认效果（`verified_by=read_back`），绝不盲目重发。
 - `Channel.WithdrawPreviewConfirmation` 撤回确认；撤回是终态，迟到的确认请求无法再次启用该项，必须重新预演。
 
 预演（items）、确认（confirmations）和实际生效（effects）三类事实都持久化在 `TraceStore` 的 `AddPreviewBatch` / `GetPreviewBatch` / `ListPreviewBatches` 中，会话中断后可按批次 ID 重开并继续确认或执行。

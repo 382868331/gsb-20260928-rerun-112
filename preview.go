@@ -42,6 +42,7 @@ type PreviewItem struct {
 type ItemConfirmation struct {
 	State           string     `json:"state"`
 	ObservedBetaRaw *float64   `json:"observed_beta_raw,omitempty"`
+	TargetBetaRaw   *float64   `json:"target_beta_raw,omitempty"`
 	Fingerprint     string     `json:"fingerprint"`
 	ConfirmedAt     time.Time  `json:"confirmed_at,omitempty"`
 	WithdrawnAt     *time.Time `json:"withdrawn_at,omitempty"`
@@ -77,24 +78,33 @@ func (p *PreviewBatch) event(at time.Time, stage, message string) {
 	p.Events = append(p.Events, TraceEvent{At: at, Stage: stage, Message: message})
 }
 
-// mappingFingerprint identifies the conversion rules currently in effect. If
-// any endpoint spec changes, previews confirmed under the old rules are no
+// mappingFingerprint identifies the conversion rules currently in effect
+// across the whole channel. Every map entry is hashed (sorted by key) so
+// that updating any single registered key is always detected. If any
+// endpoint spec changes, previews confirmed under the old rules are no
 // longer valid.
 func (c *Channel) mappingFingerprint() string {
-	unique := map[string]FieldMapping{}
-	for _, m := range c.Mappings {
-		unique[m.Name] = m
+	keys := make([]string, 0, len(c.Mappings))
+	for key := range c.Mappings {
+		keys = append(keys, key)
 	}
-	names := make([]string, 0, len(unique))
-	for name := range unique {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	sort.Strings(keys)
 	h := fnv.New64a()
-	for _, name := range names {
-		data, _ := json.Marshal(unique[name])
+	for _, key := range keys {
+		_, _ = h.Write([]byte(key))
+		data, _ := json.Marshal(c.Mappings[key])
 		_, _ = h.Write(data)
 	}
+	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+// fieldFingerprint identifies the conversion rules of one field: the full
+// endpoint specs (data type, unit, scale, offset, range, endianness, tags)
+// that decide how the confirmed value is converted and written.
+func fieldFingerprint(mapping FieldMapping) string {
+	data, _ := json.Marshal(mapping)
+	h := fnv.New64a()
+	_, _ = h.Write(data)
 	return fmt.Sprintf("%016x", h.Sum64())
 }
 
@@ -208,11 +218,16 @@ func (c *Channel) ConfirmPreviewItem(previewID, field string) ([]string, error) 
 	if item == nil || item.Status != "ok" {
 		return nil, fmt.Errorf("preview item %s is blocked and cannot be confirmed", field)
 	}
+	mapping, ok := c.Mappings[field]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedField, field)
+	}
 	conflicts := c.crossPreviewConflicts(preview, *item)
 	confirmation.State = ConfirmConfirmed
 	confirmation.ConfirmedAt = c.Now()
 	confirmation.ObservedBetaRaw = item.CurrentBetaRaw
-	confirmation.Fingerprint = preview.Fingerprint
+	confirmation.TargetBetaRaw = item.TargetBetaRaw
+	confirmation.Fingerprint = fieldFingerprint(mapping)
 	preview.Conflicts = append(preview.Conflicts, conflicts...)
 	preview.event(c.Now(), "item_confirmed", field)
 	for _, conflict := range conflicts {
@@ -280,7 +295,6 @@ func (c *Channel) ExecuteConfirmedPreview(ctx context.Context, previewID string)
 	if !ok {
 		return PreviewBatch{}, fmt.Errorf("unknown preview %s", previewID)
 	}
-	fingerprint := c.mappingFingerprint()
 	preview.event(c.Now(), "execute_start", fmt.Sprintf("executing confirmed items of preview %s", previewID))
 	for i := range preview.Items {
 		item := preview.Items[i]
@@ -289,7 +303,7 @@ func (c *Channel) ExecuteConfirmedPreview(ctx context.Context, previewID string)
 			preview.event(c.Now(), "item_skipped", item.Field+": not confirmed")
 			continue
 		}
-		effect := c.executeOne(ctx, &preview, i, confirmation, fingerprint)
+		effect := c.executeOne(ctx, &preview, i, confirmation)
 		preview.Effects = append(preview.Effects, effect)
 		preview.event(c.Now(), "effect_"+effect.Outcome, item.Field)
 	}
@@ -297,7 +311,7 @@ func (c *Channel) ExecuteConfirmedPreview(ctx context.Context, previewID string)
 	return preview, nil
 }
 
-func (c *Channel) executeOne(ctx context.Context, preview *PreviewBatch, index int, confirmation *ItemConfirmation, fingerprint string) EffectFact {
+func (c *Channel) executeOne(ctx context.Context, preview *PreviewBatch, index int, confirmation *ItemConfirmation) EffectFact {
 	item := preview.Items[index]
 	effect := EffectFact{Field: item.Field, At: c.Now()}
 	mapping, ok := c.Mappings[item.Field]
@@ -306,6 +320,27 @@ func (c *Channel) executeOne(ctx context.Context, preview *PreviewBatch, index i
 		effect.Outcome = ItemFailed
 		return effect
 	}
+	// Re-validate this item against every fact the operator confirmed,
+	// before any device traffic: the conversion rules of this field and
+	// the exact device-side value that was approved.
+	if confirmation.Fingerprint != fieldFingerprint(mapping) {
+		confirmation.State = ConfirmNeedsReconfirm
+		effect.Outcome = ItemNotAttempted
+		return effect
+	}
+	target, err := mapping.AlphaToBeta(item.Requested)
+	if err != nil {
+		confirmation.State = ConfirmNeedsReconfirm
+		effect.Outcome = ItemFailed
+		return effect
+	}
+	if confirmation.TargetBetaRaw == nil || math.Abs(target-*confirmation.TargetBetaRaw) > 1e-9 {
+		confirmation.State = ConfirmNeedsReconfirm
+		effect.Outcome = ItemNotAttempted
+		return effect
+	}
+	// Send exactly the value the operator confirmed.
+	target = *confirmation.TargetBetaRaw
 	recorder := frameRecorderFunc(func(direction, protocol string, data []byte) {
 		item.Frames = append(item.Frames, TraceFrame{Direction: direction, Protocol: protocol, Hex: fmtHex(data)})
 	})
@@ -317,21 +352,9 @@ func (c *Channel) executeOne(ctx context.Context, preview *PreviewBatch, index i
 		return effect
 	}
 	effect.ObservedBetaRaw = &current
-	// Re-validate only this item against the facts the operator confirmed.
-	if confirmation.Fingerprint != fingerprint {
-		confirmation.State = ConfirmNeedsReconfirm
-		effect.Outcome = ItemNotAttempted
-		return effect
-	}
 	if confirmation.ObservedBetaRaw == nil || math.Abs(current-*confirmation.ObservedBetaRaw) > 1e-9 {
 		confirmation.State = ConfirmNeedsReconfirm
 		effect.Outcome = ItemNotAttempted
-		return effect
-	}
-	target, err := mapping.AlphaToBeta(item.Requested)
-	if err != nil {
-		confirmation.State = ConfirmNeedsReconfirm
-		effect.Outcome = ItemFailed
 		return effect
 	}
 	effect.SentBetaRaw = &target

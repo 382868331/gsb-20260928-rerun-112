@@ -131,6 +131,125 @@ func TestExecuteFlagsOnlyAffectedItemsWhenDeviceOrRulesChange(t *testing.T) {
 	}
 }
 
+func TestMappingRuleChangeAfterConfirmInvalidatesTemperatureOnly(t *testing.T) {
+	device := NewSimulatedBetaDevice(map[string]int32{"T1": 25000, "P1": 0})
+	channel, _ := newTestChannel(t, device, time.Second)
+
+	preview := channel.PreviewConditionalBatch(context.Background(), []ConditionalWriteRequest{
+		{Field: "temperature", Value: 2310}, // 231.0 degC -> beta raw 23100
+		{Field: "pressure", Value: 68.94757},
+	})
+	temp := preview.Items[0]
+	if temp.Status != "ok" || temp.TargetBetaRaw == nil || *temp.TargetBetaRaw != 23100 {
+		t.Fatalf("temperature preview=%+v", temp)
+	}
+	for _, field := range []string{"temperature", "pressure"} {
+		if _, err := channel.ConfirmPreviewItem(preview.ID, field); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Change the temperature alpha->device conversion ratio after the
+	// confirmation, updating only the field-name key of the mapping table.
+	mapping := channel.Mappings["temperature"]
+	mapping.Alpha.Scale = 0.01
+	channel.Mappings["temperature"] = mapping
+
+	executed, err := channel.ExecuteConfirmedPreview(context.Background(), preview.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executed.Confirms["temperature"].State != ConfirmNeedsReconfirm {
+		t.Fatalf("temperature confirmation=%s after rule change", executed.Confirms["temperature"].State)
+	}
+	for _, effect := range executed.Effects {
+		if effect.Field == "temperature" {
+			if effect.Outcome != ItemNotAttempted || effect.SentBetaRaw != nil {
+				t.Fatalf("temperature executed despite rule change: %+v", effect)
+			}
+		}
+	}
+	if v, _ := device.Value("T1"); v != 25000 {
+		t.Fatalf("T1=%d, confirmation under old conversion rules must not execute", v)
+	}
+	// The unchanged pressure field still executes on its own.
+	if executed.Confirms["pressure"].State != ConfirmConfirmed {
+		t.Fatalf("pressure confirmation=%s", executed.Confirms["pressure"].State)
+	}
+	if v, _ := device.Value("P1"); v != 1000 {
+		t.Fatalf("P1=%d, unaffected confirmed item must proceed", v)
+	}
+
+	// The invalidated item needs a fresh preview and confirmation.
+	preview2 := channel.PreviewConditionalBatch(context.Background(), []ConditionalWriteRequest{
+		{Field: "temperature", Value: 2310},
+	})
+	if _, err := channel.ConfirmPreviewItem(preview2.ID, "temperature"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := channel.ExecuteConfirmedPreview(context.Background(), preview2.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Under the new ratio 2310 alpha raw is 23.10 degC -> beta raw 2310.
+	if v, _ := device.Value("T1"); v != 2310 {
+		t.Fatalf("T1=%d after re-preview under the new rules", v)
+	}
+}
+
+func TestExecuteSendsExactlyTheConfirmedValue(t *testing.T) {
+	device := NewSimulatedBetaDevice(map[string]int32{"T1": 25000})
+	channel, _ := newTestChannel(t, device, time.Second)
+
+	preview := channel.PreviewConditionalBatch(context.Background(), []ConditionalWriteRequest{
+		{Field: "temperature", Value: 2310},
+	})
+	if _, err := channel.ConfirmPreviewItem(preview.ID, "temperature"); err != nil {
+		t.Fatal(err)
+	}
+	confirmation := preview.Confirms["temperature"]
+	if confirmation.TargetBetaRaw == nil || *confirmation.TargetBetaRaw != 23100 {
+		t.Fatalf("confirmed target=%+v", confirmation.TargetBetaRaw)
+	}
+	executed, err := channel.ExecuteConfirmedPreview(context.Background(), preview.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(executed.Effects) != 1 || executed.Effects[0].Outcome != ItemApplied {
+		t.Fatalf("effects=%+v", executed.Effects)
+	}
+	sent := executed.Effects[0].SentBetaRaw
+	if sent == nil || *sent != *confirmation.TargetBetaRaw {
+		t.Fatalf("sent=%v confirmed=%v: the written value must equal the confirmed value", sent, *confirmation.TargetBetaRaw)
+	}
+	if v, _ := device.Value("T1"); v != 23100 {
+		t.Fatalf("T1=%d, device must hold the confirmed value", v)
+	}
+}
+
+func TestWithdrawnConfirmationBlocksExecution(t *testing.T) {
+	device := NewSimulatedBetaDevice(map[string]int32{"T1": 25000})
+	channel, _ := newTestChannel(t, device, time.Second)
+
+	preview := channel.PreviewConditionalBatch(context.Background(), []ConditionalWriteRequest{
+		{Field: "temperature", Value: 2310},
+	})
+	if _, err := channel.ConfirmPreviewItem(preview.ID, "temperature"); err != nil {
+		t.Fatal(err)
+	}
+	if err := channel.WithdrawPreviewConfirmation(preview.ID, "temperature"); err != nil {
+		t.Fatal(err)
+	}
+	executed, err := channel.ExecuteConfirmedPreview(context.Background(), preview.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(executed.Effects) != 0 {
+		t.Fatalf("effects=%+v, withdrawn confirmation must not execute", executed.Effects)
+	}
+	if v, _ := device.Value("T1"); v != 25000 {
+		t.Fatalf("T1=%d, withdrawn confirmation must not write", v)
+	}
+}
+
 func TestWithdrawnConfirmationCannotBeReenabledByLateRequest(t *testing.T) {
 	device := NewSimulatedBetaDevice(map[string]int32{"T1": 25000})
 	channel, _ := newTestChannel(t, device, time.Second)
